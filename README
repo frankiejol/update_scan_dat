@@ -1,0 +1,13 @@
+This script performs an automatic update of the dat files for Mcaffee Virus Scan command line for Linux
+
+Requires:
+ - uvscan
+ - a bunch of perl modules
+
+License:
+
+GNU GENERAL PUBLIC LICENSE Version 3
+http://www.gnu.org/licenses/gpl.html
+
+By:
+Francesc Guasch -  frankie  etsetb upc edu

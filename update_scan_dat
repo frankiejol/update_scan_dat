@@ -1,0 +1,475 @@
+#!/usr/bin/perl -w
+
+##
+my $VERSION = "0.23";
+#
+# 0.23  : checks for uvscan version
+# 0.22  : support for vvdat release
+# 0.21	: proxy config from command line
+# 0.20	: proxy support builtin
+# 0.11	: Si el nou .dat es incorrecte no l'instala
+# 0.10  : verbose option
+# 0.09  : ls amb Net::FTP
+#         - verifica que el uscan funcioni amb els nous dats abans de copiar-lo
+# 0.08	: canvi en la URL de NAI. Download dels fitxers catalog.z i SiteStat.xmlnecesaris per l'actualitzacio de la versio 7.1 dels clients per Windows.
+# 0.071 : resol petit error que pasa de vegades mirant l'antiguitat del .zip
+# 0.07	: esborra zips mes antics de "keep_days_files"
+# 0.06  : arguments, fitxer de configuracio
+# 0.04  : mail si error durant l'update. wget en mode passiu. divissio en subrutines de l'accio, per control de l'upgrade
+# 0.036 : chmod go+rx dels .dat
+
+
+use strict;
+
+use Config::General;
+use Cwd;
+use Date::Calc qw(Today_and_Now);
+use File::Copy;
+use Getopt::Long;
+use HTTP::Request;
+use LWP::UserAgent;
+use Net::FTP;
+use Net::SMTP;
+use Proc::PID::File;
+
+############################################################
+#
+# CONFIG
+#
+
+my $VSCAN_VERSION=5.30;
+my $CONFIG_FILE = "/etc/update_scan_dat.conf";
+my @CONFIG_VALID = qw(debug force tmp_dir log_file uvscan_dir report sender group verbose);
+my %CONFIG_DEFAULT = (
+	debug => 0,
+	force => 0,
+	verbose => 0,
+	home_uri => 'http://update.nai.com/products/commonupdater',
+	tmp_dir => "/var/tmp/scan",
+	log_file => '/var/log/update_scan.log',
+	uvscan_dir => "/usr/local/uvscan",
+	sender => 'postmaster',
+	report => 'virusalert',
+	group => 'users',
+	days_keep_files => 60,
+	mailhost => 'localhost',
+	pid_dir => '/var/run',
+	ftp_proxy => undef,
+	http_proxy => undef,
+	file_ini => 'avvdat.ini',
+);
+my %CONFIG;
+
+# Check for scan .dat files there
+
+# dat-xxxx.tar link
+my $RM="/bin/rm";
+my $WGET="/usr/bin/wget";
+my $TAR="/bin/tar";
+my $MKDIR="/bin/mkdir";
+my $CHMOD="/bin/chmod";
+my $TOUCH="/bin/touch";
+my $UNZIP = '/usr/bin/unzip';
+my $FTP_TRY=20;
+my $SLEEP = 60;
+
+################################################################
+
+
+my $ua= new LWP::UserAgent;
+$ua->agent("UpdateDat/$VERSION ".$ua->agent);
+
+###################################################################
+
+sub report {
+        my $version = shift;
+        my $subject = "Subject: DAT files updated\n";
+        $subject = "FAIL to install new DAT file" if $version =~ /FAILED/;
+        my $smtp = Net::SMTP->new($CONFIG{mailhost});
+                                                                                
+           $smtp->mail($CONFIG{sender});
+           $smtp->to($CONFIG{report});
+           $smtp->data();
+           $smtp->datasend("To: $CONFIG{report}\n");
+           $smtp->datasend($subject);
+           $smtp->datasend("\n");
+           $smtp->datasend("Virus dat files updated with version $version\n");
+           $smtp->dataend();
+           $smtp->quit;
+}
+                                                                                
+sub request {
+        my $tries = 2;
+        my $end = 0;
+        
+        my $uri = shift;
+        do_log ("I need the uri") unless defined $uri;
+        my $res;
+
+		for (;;) {
+                my $req = HTTP::Request->new(GET => $uri );
+                $res = $ua->request($req);
+				last if $res->is_success or $tries-- < 0;
+                do_log ("[$tries] [".$res->code()."] ".$res->message);
+                sleep 5;
+        }
+
+        do_log ("$uri failed after some tries: ".$res->message)
+                unless ($res->is_success);
+        return $res;
+}
+
+sub config {
+	my $options = shift;
+	my $config_data;
+	eval {
+		$config_data = Config::General->new($CONFIG_FILE);
+		%CONFIG = $config_data->getall;
+	};
+	for (keys %CONFIG_DEFAULT) {
+		$CONFIG{$_} = $CONFIG_DEFAULT{$_}
+			unless exists $CONFIG{$_};
+	}
+	for (@CONFIG_VALID) {
+		die "config $CONFIG_FILE needs $_\n"
+			unless exists $CONFIG{$_};
+	}
+	for (keys %CONFIG) {
+		if (exists $options->{$_} && defined $options->{$_}){
+			warn "runtime $_ option value takes over $options->{$_}\n"
+				if $options->{debug} 
+					&& $CONFIG{$_} && defined $CONFIG{$_};
+			$CONFIG{$_} = $options->{$_};
+		}
+		delete $options->{$_};
+	}
+	die "Unknown runtime options :".(join ",",keys %$options)."\n"
+		if keys %$options;
+}
+
+sub getopt {
+	my ($help,$version);#,$debug,$force);
+	my $options;
+	GetOptions(help => \$help, 
+			   version => \$version, 
+				 debug => \$options->{debug},
+			     force => \$options->{force},
+				config => \$CONFIG_FILE,
+			 'group=s' => \$options->{group},
+			'sender=s' => \$options->{sender},
+			'report=s' => \$options->{report},
+		  'mailhost=s' => \$options->{mailhost},
+		'uvscan-dir=s' => \$options->{uvscan_dir},
+		'http-proxy=s' => \$options->{http_proxy},
+		 'ftp-proxy=s' => \$options->{ftp_proxy},
+			   'tmp=s' => \$options->{tmp_dir},
+	);
+	my $me = $0;
+	$me =~ s#.*/##;
+	if ($help) {
+		print "$me [--help] [--version] [--debug] [--force] [--group=$CONFIG_DEFAULT{group}] [--sender=$CONFIG_DEFAULT{sender}] [--report=$CONFIG_DEFAULT{report}] [--mailhost=$CONFIG_DEFAULT{mailhost}] [uvscan-dir=$CONFIG_DEFAULT{uvscan_dir}] [--tmp=$CONFIG_DEFAULT{tmp_dir}]\n";
+		exit(0);
+	}
+	if ($version) {
+		print "$me $VERSION\n";
+		exit(0);
+	}
+#	for (keys %$options) {
+#		delete $options->{$_};
+#	}
+	return $options;
+}
+
+sub init {
+	die "Can't find $RM\n" unless -f $RM;
+	die "Can't find $WGET\n" unless -f $WGET;
+	die "Can't find $TAR\n" unless -f $TAR;
+	die "Can't find $MKDIR\n" unless -f $MKDIR;
+	die "Can't find $TOUCH\n" unless -f $TOUCH;
+	die "Can't find $CHMOD\n" unless -f $CHMOD;
+	die "Can't find $UNZIP\n" unless -f $UNZIP;
+
+	unless ( -d $CONFIG{tmp_dir} ) {
+		my ($anterior) = $CONFIG{tmp_dir} =~ m!(.*)/.*?!;
+		unless (-e $anterior) {
+			mkdir $anterior,0750 or die "Can't mkdir $anterior\n";
+		}
+		mkdir $CONFIG{tmp_dir},0750;
+		die if $?;
+		die "Can't mkdir $CONFIG{tmp_dir}" unless -d $CONFIG{tmp_dir};
+	}
+	unless (-f $CONFIG{log_file}) {
+		`$TOUCH $CONFIG{log_file}`;
+		die if $?;
+		die "Can't create $CONFIG{log_file}" unless -f $CONFIG{log_file};
+	}
+	die "Already running!" if Proc::PID::File->running(dir=>$CONFIG{pid_dir});
+	$ua->proxy('http',($ENV{http_proxy} or $CONFIG{http_proxy} or '' ) );
+	$ua->proxy('ftp',($ENV{ftp_proxy} or $CONFIG{ftp_proxy} or '') );
+
+}
+
+
+sub check_current_dat {
+        my $ver = `$CONFIG{uvscan_dir}/uvscan --version` 
+                or do_log("Can't find installed uvscan");
+        my $dat_version;
+        foreach (split /\n/, $ver) {
+                next unless $_ =~ /^Virus data file v(\d+)/
+								|| /^Dat set version: (\d+)/;
+                $dat_version = ($1);
+        }
+	unless (defined $dat_version && $dat_version =~ /^\d+$/) {
+		warn "Unknown dat_version: $dat_version\n" if defined $dat_version;
+		$dat_version = '0';
+	}
+	print "Installed version is $dat_version\n" if $CONFIG{debug};
+	return $dat_version;
+}
+
+sub do_log {
+        my $message = shift;
+        my ($year,$month,$day, $hour,$min,$sec) = Today_and_Now();
+        $year = "0".$year if $year =~ /^\d$/;
+        $month = "0".$month if $month =~ /^\d$/;
+        $hour = "0".$hour if $hour =~ /^\d$/;
+        $min = "0".$min if $min =~ /^\d$/;
+        $sec = "0".$sec if $sec =~ /^\d$/;
+        my $now = "$day/$month/$year-$hour:$min:$sec";
+        open (LOG, ">>$CONFIG{log_file}") or die "Can't open $CONFIG{log_file}\n";
+        $message = "[ERROR] ".$message unless $message =~ /^\[OK\]/;
+        print LOG "$now $message\n";
+        close LOG;
+        exit unless $message =~ /\[\d\]/;
+}
+
+sub wget {
+	my $uri = shift;
+	my $content ='';
+	my $cmd = "$WGET passive-ftp -q -O - $uri";
+	warn "$cmd\n" if $CONFIG{debug};
+	open WGET ,"$cmd|" or die "$! $cmd\n"
+		or die $!;
+	while (<WGET>) {
+		$content .= $_;
+	}
+	close WGET;
+	return $content;
+}
+
+sub get_content_lwp {
+	my $uri = shift;
+	warn "get_content_lwp $uri\n" if $CONFIG{debug};
+	my $content = '';
+	my $res = request($uri);
+	$content = $res->content();
+	unless (length $content) {
+		$content = wget($uri);
+	}
+	warn "content gotten\n" if $CONFIG{debug};
+	return $content;
+}
+
+sub ftp_ls {
+	my $uri = shift;
+	die "I can't handle $uri (only ftp)\n" unless $uri =~ /^ftp:\/\//;
+	my ($server,$dir) = $uri =~ m#ftp://(.*?)(/.*)#;
+	die "I can't find a server / dir in $uri\n" unless
+		defined $server && defined $dir;
+	warn "Getting $server / $dir\n" if $CONFIG{debug};
+	my $ftp = Net::FTP->new($server,Debug => 0)
+		or die "Cannot connect to $server: $@\n";
+	$ftp->login("anonymous",'-anonymous@')
+             or die "Cannot login ", $ftp->message;
+	$ftp->cwd("$dir")
+             or die "Cannot change working directory $dir ", $ftp->message;
+	my @dir = $ftp->ls($dir);
+	unless (@dir) {
+		$ftp = Net::FTP->new($server,Debug => 0, TimeOut => 300)
+        	or die "Cannot connect to $server: $@\n";
+		$ftp->login("anonymous",'-anonymous@')
+             or die "Cannot login ", $ftp->message;
+		my $port = $ftp->pasv();
+		@dir = $ftp->ls($dir);
+	}
+	$ftp->quit;
+	return join "\n",@dir;
+}
+
+sub get_content {
+	my $uri = shift;
+	my $content;
+	warn "get_content $uri\n" if $CONFIG{debug};
+	for (1..$FTP_TRY) {
+		warn " get_content try $_\n" if $CONFIG{debug};
+		$content = get_content_lwp($uri);
+		last if $content;
+		$content = ftp_ls($uri);
+		last if $content;
+		sleep $SLEEP;
+	}
+	die "Empty content from $uri\n" unless $content;
+	return $content;
+}
+
+sub nai_dat_version {
+        my $res = get_content($CONFIG{home_uri});
+		die "Empty content\n" unless length $res;
+		# or wget($CONFIG{home_uri}) or get_content_lwp($CONFIG{home_uri}));
+        my $dat_url;
+        foreach (split /\n/,$res) {
+                next unless ($dat_url) = /dat-(.*?)\.zip/;
+                last if $dat_url;
+        }
+        do_log ("I can't find the dat zip link")
+                unless $dat_url;
+        print "Current NAI version is $dat_url\n" if $CONFIG{debug};
+        return $dat_url;
+}
+
+sub download_dat {
+        my $dat = shift;
+        my $file = "dat-".$dat.".tar";
+        my $dat_url = $CONFIG{home_uri}.$file;
+        chdir $CONFIG{tmp_dir} or do_log ("$! $CONFIG{tmp_dir}");
+        unlink $file if -f $file;
+        print "Downloading $dat_url\n" if $CONFIG{debug};
+        `$WGET --passive-ftp -q $dat_url`;
+}
+
+sub download_zip {
+		my $dat = shift;
+		my $dat_zip = "avvdat-".$dat.".zip";
+		if (! -d $CONFIG{tmp_dir} ) {
+			mkdir $CONFIG{tmp_dir},0777 or die "$! $CONFIG{tmp_dir}";
+		}
+        chdir $CONFIG{tmp_dir} or do_log ("$! $CONFIG{tmp_dir}");
+		for my $file (($dat_zip,'avvdat.ini','catalog.z','SiteStat.xml')) {
+			my $file_uri = "$CONFIG{home_uri}/$file";
+        	next if -f $file;
+			print "Downloading $file_uri\nb" if $CONFIG{debug};
+        	`$WGET --passive-ftp -q $file_uri`;
+			do_log("can't download $file_uri")
+				if !-f $file;
+		}
+		`chmod 770 *`;
+		`chgrp $CONFIG{group} *`;
+		return 1;
+}
+                                                                                
+sub untar_dat {
+        my $dat = shift;
+        print "Going to untar $dat\n" if $CONFIG{debug};
+        chdir $CONFIG{uvscan_dir} or do_log ("$! $CONFIG{uvscan_dir}");
+        `tar xvf $CONFIG{tmp_dir}/dat-$dat.tar` or do_log ("$!");
+	`$CHMOD go+rx *`;
+        my $pwd =getcwd;
+        print "Error $? doing chmod in $pwd\n" if $?;
+
+        unlink "$CONFIG{tmp_dir}/dat-$dat.tar" or do_log ("$!");
+}
+
+sub check_new_dats {
+	my $dat = shift;
+	for (qw(messages.dat uvscan license.dat )) {
+		copy("$CONFIG{uvscan_dir}/$_","$CONFIG{tmp_dir}/new") or die $!;
+	}
+	chmod 0700,'uvscan';
+	my $out = `./uvscan --version 2>&1`;
+	return 1 unless $?;
+	warn "ERROR IN dat-$dat.zip\nError $? in ".`pwd`."\n$out\n";
+	return 0;
+}
+
+sub unzip_dat {
+	my $dat = shift;
+	chdir $CONFIG{tmp_dir} or die "$! $CONFIG{tmp_dir}";
+	mkdir 'new',0755 or die "$! $CONFIG{tmp_dir}/new\n"
+		unless -d 'new';
+	`rm -f ./new/*`;
+	chdir "new" or die "$! $CONFIG{tmp_dir}/new\n";
+	my $out=`$UNZIP -o ../avvdat-$dat.zip`;
+	do_log("problem unzipping '$CONFIG{tmp_dir}/avvdat-$dat.zip' : $out")
+		if $?;
+	return unless check_new_dats($dat);
+	chdir $CONFIG{tmp_dir} or die "$! $CONFIG{tmp_dir}";
+	mkdir 'old',0755 or die "$! $CONFIG{tmp_dir}/old\n"
+		unless -d 'old';
+	opendir NEW,"$CONFIG{tmp_dir}/new" or die $!;
+	my $file;
+	while ($file=readdir(NEW)) {
+		next unless -f "$CONFIG{tmp_dir}/new/$file";
+		copy "$CONFIG{tmp_dir}/$file","$CONFIG{tmp_dir}/old"
+			or do_log("I can't copy $CONFIG{tmp_dir}/$file -> $CONFIG{tmp_dir}/old\n$!")
+				if -f "$CONFIG{tmp_dir}/$file";
+		copy "$CONFIG{tmp_dir}/new/$file",$CONFIG{tmp_dir} 
+			or do_log("I can't copy $CONFIG{tmp_dir}/new/$file -> $CONFIG{tmp_dir}\n$!");
+		copy "$CONFIG{tmp_dir}/new/$file",$CONFIG{uvscan_dir}
+			or do_log("I can't copy $CONFIG{tmp_dir}/new/$file -> $CONFIG{tmp_dir}\n$!");
+	}
+	closedir NEW;
+	chdir $CONFIG{uvscan_dir} or die $!;
+	`$CHMOD go+rx *`;
+	clean_old_zip();
+}
+
+sub clean_old_zip {
+	my @date = localtime(time);
+	return unless $date[6]==1;
+	opendir LS,$CONFIG{tmp_dir} or die "$! $CONFIG{tmp_dir}\n";
+	my $file;
+	while ($file=readdir LS) {
+		chomp $file;
+		next unless $file =~ /\.zip/;
+		my @stat = stat("$CONFIG{tmp_dir}/$file");
+		my $dies = (time - $stat[9])/3600/24;
+		next if $dies<$CONFIG{days_keep_files};
+		warn "Purging $file ".int($dies)." days old, ".
+			"max=$CONFIG{days_keep_files}\n";
+		unlink "$CONFIG{tmp_dir}/$file" 
+			or die "$! $CONFIG{tmp_dir}/$file\n";
+	}
+	closedir LS;
+}
+                                                                                
+sub update_dat_zip {
+	my $dat = shift;
+	download_zip($dat)
+		and unzip_dat($dat);
+}
+
+sub check_uvscan_release {
+	my $version;
+	open VSCAN,"$CONFIG{uvscan_dir}/uvscan --version|" or die $!;
+	while (<VSCAN>) {
+		($version) = /v(\d+\.\d+)/;
+		last if $version;
+	}
+	close VSCAN;
+	die "uvscan version $version unsupported. $VSCAN_VERSION or better required\n"
+		if ($version < $VSCAN_VERSION)
+}
+
+###########################################################
+                                                                             
+my $options = getopt();
+config($options);
+check_uvscan_release();
+init();
+my $nai_dat = nai_dat_version();
+
+unless (defined $nai_dat) {
+    warn "Unable to get nai ftp dat version\n";
+    exit(-1);
+};
+if ($CONFIG{force} ||  $nai_dat != check_current_dat() ) {
+        update_dat_zip($nai_dat);
+        if (check_current_dat() eq $nai_dat) {
+                report ($nai_dat);
+                do_log ("[OK] Installed new DAT. Current DAT version is $nai_dat");
+        } else {
+                report ("FAILED");
+        }
+} else {
+        do_log ("[OK] Current DAT file is up to date (DAT version $nai_dat)");
+}
