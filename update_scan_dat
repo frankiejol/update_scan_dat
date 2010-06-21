@@ -449,7 +449,6 @@ sub check_uvscan_release {
 	open VSCAN,"$CONFIG{uvscan_dir}/uvscan --version|" or die $!;
 	while (<VSCAN>) {
 		$out.=$_;
-		print;
 		($version) = /v([\d+\.]+)/;
 		last if defined $version;
 		($version) = /Version: ([\d+\.]+)/;
