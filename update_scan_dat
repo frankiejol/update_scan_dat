@@ -371,11 +371,19 @@ sub untar_dat {
 
 sub check_new_dats {
 	my $dat = shift;
-	for (qw(messages.dat uvscan license.dat )) {
-		copy("$CONFIG{uvscan_dir}/$_","$CONFIG{tmp_dir}/new") or die $!;
+	opendir UVSCAN,"$CONFIG{uvscan_dir}" or die $!;
+	while (my $file = readdir UVSCAN) {
+		next if ! -f "$CONFIG{uvscan_dir}/$file";
+		copy("$CONFIG{uvscan_dir}/$file","$CONFIG{tmp_dir}/new") 
+			or die "$! $CONFIG{uvscan_dir}/$file";
 	}
 	chmod 0700,'uvscan';
-	my $out = `./uvscan --version 2>&1`;
+
+	my $out=`$UNZIP -o ../avvdat-$dat.zip`;
+    do_log("problem unzipping '$CONFIG{tmp_dir}/avvdat-$dat.zip' : $out")
+        if $?;
+
+	$out = `./uvscan --version 2>&1`;
 	return 1 unless $?;
 	warn "ERROR IN dat-$dat.zip\nError $? in ".`pwd`."\n$out\n";
 	return 0;
@@ -388,9 +396,6 @@ sub unzip_dat {
 		unless -d 'new';
 	`rm -f ./new/*`;
 	chdir "new" or die "$! $CONFIG{tmp_dir}/new\n";
-	my $out=`$UNZIP -o ../avvdat-$dat.zip`;
-	do_log("problem unzipping '$CONFIG{tmp_dir}/avvdat-$dat.zip' : $out")
-		if $?;
 	return unless check_new_dats($dat);
 	chdir $CONFIG{tmp_dir} or die "$! $CONFIG{tmp_dir}";
 	mkdir 'old',0755 or die "$! $CONFIG{tmp_dir}/old\n"
@@ -440,13 +445,27 @@ sub update_dat_zip {
 
 sub check_uvscan_release {
 	my $version;
+	my $out = '';
 	open VSCAN,"$CONFIG{uvscan_dir}/uvscan --version|" or die $!;
 	while (<VSCAN>) {
-		($version) = /v(\d+\.\d+)/;
-		last if $version;
+		$out.=$_;
+		print;
+		($version) = /v([\d+\.]+)/;
+		last if defined $version;
+		($version) = /Version: ([\d+\.]+)/;
+		last if defined $version;
 	}
 	close VSCAN;
-	die "uvscan version $version unsupported. $VSCAN_VERSION or better required\n"
+	die "Unkonwn version from uvscan\n$out\n"
+		if !defined $version;
+
+	my ($int,$dec) = $version =~ /(\d+)\.(.*)/;
+	$dec =~ s/\.//g;
+
+	$version = "$int.$dec";
+
+	die "uvscan version $version unsupported. $VSCAN_VERSION "
+		." or better required\n"
 		if ($version < $VSCAN_VERSION)
 }
 
