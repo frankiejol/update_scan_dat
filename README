@@ -4,6 +4,15 @@ Requires:
  - uvscan
  - a bunch of perl modules
 
+How to Install:
+
+ 1. Git way: download using git, so you can modify and contribute
+
+ 2. Easy way: 
+	# cd /usr/local/sbin
+ 	# wget http://github.com/frankiejol/update_scan_dat/raw/master/update_scan_dat
+	# chmod +x update_scan_dat
+
 License:
 
 GNU GENERAL PUBLIC LICENSE Version 3
