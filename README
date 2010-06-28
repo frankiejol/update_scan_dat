@@ -2,7 +2,9 @@ This script performs an automatic update of the dat files for Mcaffee Virus Scan
 
 Requires:
  - uvscan
- - a bunch of perl modules
+ - a bunch of perl modules:
+ 	Config::General
+	deb: libconfig-general-perl
 
 How to Install:
 
@@ -13,6 +15,7 @@ How to Install:
 	# cd /usr/local/sbin
 	# wget http://github.com/frankiejol/update_scan_dat/raw/master/update_scan_dat
 	# chmod +x update_scan_dat
+
 
 License:
 
