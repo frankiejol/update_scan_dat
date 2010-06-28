@@ -1,7 +1,7 @@
 #!/usr/bin/perl -w
 
 ##
-my $VERSION = "0.23";
+my $VERSION = "0.24";
 #
 # 0.24  : decompress
 # 0.23  : checks for uvscan version
