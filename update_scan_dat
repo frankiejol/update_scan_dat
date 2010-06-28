@@ -3,6 +3,7 @@
 ##
 my $VERSION = "0.23";
 #
+# 0.24  : decompress
 # 0.23  : checks for uvscan version
 # 0.22  : support for vvdat release
 # 0.21	: proxy config from command line
@@ -122,7 +123,7 @@ sub request {
 sub config {
 	my $options = shift;
 	my $config_data;
-	eval {
+	if ( -e $CONFIG_FILE ) {
 		$config_data = Config::General->new($CONFIG_FILE);
 		%CONFIG = $config_data->getall;
 	};
@@ -416,6 +417,36 @@ sub unzip_dat {
 	chdir $CONFIG{uvscan_dir} or die $!;
 	`$CHMOD go+rx *`;
 	clean_old_zip();
+	return 1;
+}
+
+sub time_uvscan {
+	my $t0 = time;
+	open my $uvscan,"$CONFIG{uvscan_dir}/uvscan --version|" or die $!;
+	while (<$uvscan>) {
+		print if $CONFIG{debug};
+	}
+	close $uvscan;
+	return time - $t0;
+}
+
+sub decompress {
+	my $time_zip = time_uvscan();
+	chdir $CONFIG{uvscan_dir} or die "$!  $CONFIG{uvscan_dir}";
+	my $decompress_cmd = "uvscan --decompress";
+	open my $decompress, "$decompress_cmd|" or die $!;
+	while (<$decompress>) {
+		print if $CONFIG{debug};
+	}
+	close $decompress;
+	my $time_dec = time_uvscan();
+	my $report = "Time uvscan: $time_zip , Time after decompress: $time_dec";
+	if ($CONFIG{debug}) {
+		print "$report\n";
+	}
+	if ( $time_dec * 1.5 > $time_zip ) {
+		warn "WARNING: looks like $decompress_cmd failed. $report\n";
+	}
 }
 
 sub clean_old_zip {
@@ -440,7 +471,8 @@ sub clean_old_zip {
 sub update_dat_zip {
 	my $dat = shift;
 	download_zip($dat)
-		and unzip_dat($dat);
+		and unzip_dat($dat)
+		and decompress();
 }
 
 sub check_uvscan_release {
