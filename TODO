@@ -1,0 +1,5 @@
+TODO
+
+ - If not config general just run without it
+ - make %CONFIG inmutable
+
