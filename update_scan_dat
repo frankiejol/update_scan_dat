@@ -433,7 +433,7 @@ sub time_uvscan {
 sub decompress {
 	my $time_zip = time_uvscan();
 	chdir $CONFIG{uvscan_dir} or die "$!  $CONFIG{uvscan_dir}";
-	my $decompress_cmd = "uvscan --decompress";
+	my $decompress_cmd = "$CONFIG{uvscan_dir}/uvscan --decompress";
 	open my $decompress, "$decompress_cmd|" or die $!;
 	while (<$decompress>) {
 		print if $CONFIG{debug};
