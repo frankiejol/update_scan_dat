@@ -1,8 +1,16 @@
 #!/usr/bin/perl -w
 
 ##
-my $VERSION = "0.24";
+my $VERSION = "0.33";
 #
+# 0.33	: Tell the proxy Do not cache the directory listing
+# 0.32	: No need to dowload .ini
+# 0.31	: No die if OK
+# 0.30	:   - lock CONFIG.
+#			- uncompress of new dat in /usr/local/uvscan
+#			- fixed locked file
+#			- added backup of current vscan
+# 0.25	: get tar file instead of zip
 # 0.24  : decompress
 # 0.23  : checks for uvscan version
 # 0.22  : support for vvdat release
@@ -26,6 +34,7 @@ use Config::General;
 use Cwd;
 use Date::Calc qw(Today_and_Now);
 use File::Copy;
+use Hash::Util qw(lock_hash);
 use Getopt::Long;
 use HTTP::Request;
 use LWP::UserAgent;
@@ -45,7 +54,8 @@ my %CONFIG_DEFAULT = (
 	debug => 0,
 	force => 0,
 	verbose => 0,
-	home_uri => 'http://update.nai.com/products/commonupdater',
+	home_uri => 'ftp://ftp.nai.com/pub/antivirus/datfiles/4.x/',
+#	home_uri => 'http://update.nai.com/products/commonupdater',
 	tmp_dir => "/var/tmp/scan",
 	log_file => '/var/log/update_scan.log',
 	uvscan_dir => "/usr/local/uvscan",
@@ -57,7 +67,7 @@ my %CONFIG_DEFAULT = (
 	pid_dir => '/var/run',
 	ftp_proxy => undef,
 	http_proxy => undef,
-	file_ini => 'avvdat.ini',
+#	file_ini => 'avvdat.ini',
 );
 my %CONFIG;
 
@@ -109,6 +119,10 @@ sub request {
 
 		for (;;) {
                 my $req = HTTP::Request->new(GET => $uri );
+				if ($uri =~ m{/$} ) {
+					$req->header('pragma' => 'no-cache', #HTTP 1.0 header
+				                        'max-age' => '0'); #HTTP 1.1 header
+				}
                 $res = $ua->request($req);
 				last if $res->is_success or $tries-- < 0;
                 do_log ("[$tries] [".$res->code()."] ".$res->message);
@@ -146,6 +160,8 @@ sub config {
 	}
 	die "Unknown runtime options :".(join ",",keys %$options)."\n"
 		if keys %$options;
+
+	lock_hash(%CONFIG);
 }
 
 sub getopt {
@@ -241,7 +257,9 @@ sub do_log {
         $message = "[ERROR] ".$message unless $message =~ /^\[OK\]/;
         print LOG "$now $message\n";
         close LOG;
-        exit unless $message =~ /\[\d\]/;
+        return if $message =~ /\[\d\]/;
+		exit(0) if $message =~ /^\[OK/;
+		die "$message\n";
 }
 
 sub wget {
@@ -310,6 +328,7 @@ sub get_content {
 		sleep $SLEEP;
 	}
 	die "Empty content from $uri\n" unless $content;
+	warn $content if $CONFIG{debug};
 	return $content;
 }
 
@@ -319,10 +338,10 @@ sub nai_dat_version {
 		# or wget($CONFIG{home_uri}) or get_content_lwp($CONFIG{home_uri}));
         my $dat_url;
         foreach (split /\n/,$res) {
-                next unless ($dat_url) = /dat-(.*?)\.zip/;
+                next unless ($dat_url) = /dat-(.*?)\.tar/;
                 last if $dat_url;
         }
-        do_log ("I can't find the dat zip link")
+        do_log ("I can't find the dat link")
                 unless $dat_url;
         print "Current NAI version is $dat_url\n" if $CONFIG{debug};
         return $dat_url;
@@ -338,14 +357,14 @@ sub download_dat {
         `$WGET --passive-ftp -q $dat_url`;
 }
 
-sub download_zip {
+sub download_tar {
 		my $dat = shift;
-		my $dat_zip = "avvdat-".$dat.".zip";
+		my $dat_zip = "avvdat-".$dat.".tar";
 		if (! -d $CONFIG{tmp_dir} ) {
 			mkdir $CONFIG{tmp_dir},0777 or die "$! $CONFIG{tmp_dir}";
 		}
         chdir $CONFIG{tmp_dir} or do_log ("$! $CONFIG{tmp_dir}");
-		for my $file (($dat_zip,'avvdat.ini','catalog.z','SiteStat.xml')) {
+		for my $file (($dat_zip)) {
 			my $file_uri = "$CONFIG{home_uri}/$file";
         	next if -f $file;
 			print "Downloading $file_uri\nb" if $CONFIG{debug};
@@ -358,64 +377,105 @@ sub download_zip {
 		return 1;
 }
                                                                                 
-sub untar_dat {
-        my $dat = shift;
-        print "Going to untar $dat\n" if $CONFIG{debug};
-        chdir $CONFIG{uvscan_dir} or do_log ("$! $CONFIG{uvscan_dir}");
-        `tar xvf $CONFIG{tmp_dir}/dat-$dat.tar` or do_log ("$!");
-	`$CHMOD go+rx *`;
-        my $pwd =getcwd;
-        print "Error $? doing chmod in $pwd\n" if $?;
-
-        unlink "$CONFIG{tmp_dir}/dat-$dat.tar" or do_log ("$!");
+sub extract_tar {
+	my $file = shift;
+	print "extracting $file (".getcwd.")\n" if $CONFIG{debug};
+	open TAR,"$TAR xvf $file|" or die $!;
+	while (<TAR>) {
+		print if $CONFIG{debug};
+	}
+	close TAR;
+	do_log("problem unzipping '$CONFIG{tmp_dir}/$file") if $?;
 }
 
-sub check_new_dats {
+sub check_new_dat {
+
 	my $dat = shift;
-	opendir UVSCAN,"$CONFIG{uvscan_dir}" or die $!;
-	while (my $file = readdir UVSCAN) {
-		next if ! -f "$CONFIG{uvscan_dir}/$file";
-		copy("$CONFIG{uvscan_dir}/$file","$CONFIG{tmp_dir}/new") 
-			or die "$! $CONFIG{uvscan_dir}/$file";
-	}
-	chmod 0700,'uvscan';
 
-	my $out=`$UNZIP -o ../avvdat-$dat.zip`;
-    do_log("problem unzipping '$CONFIG{tmp_dir}/avvdat-$dat.zip' : $out")
-        if $?;
+    opendir UVSCAN,"$CONFIG{uvscan_dir}" or die $!;
+    while (my $file = readdir UVSCAN) {
+        next if ! -f "$CONFIG{uvscan_dir}/$file";
+        copy("$CONFIG{uvscan_dir}/$file","$CONFIG{tmp_dir}/new")
+            or die "$! $CONFIG{uvscan_dir}/$file";
+    }
+    chmod 0700,'uvscan';
+    my $dat_tar = "avvdat-$dat.tar";
+    extract_tar("../$dat_tar");
 
-	$out = `./uvscan --version 2>&1`;
+	return check_uvscan("$CONFIG{tmp_dir}/new");
+}
+
+sub check_uvscan {
+	my $dir = shift;
+
+	warn "check_uvscan $dir\n" if $CONFIG{debug};
+
+	chdir "$dir" or die "$! $dir";
+
+	my $out = `./uvscan --version 2>&1`;
+	warn "Checked result = $?" if $CONFIG{debug};
+	warn $out if $CONFIG{debug};
 	return 1 unless $?;
-	warn "ERROR IN dat-$dat.zip\nError $? in ".`pwd`."\n$out\n";
+	warn "ERROR IN dat $dir\nError $? in ".`pwd`."\n$out\n";
 	return 0;
 }
 
-sub unzip_dat {
+sub backup_uvscan {
+
+	my $dir = shift;
+
+    mkdir $dir,0755 or die "$! $dir}\n"
+        unless -d $dir;
+    opendir DIR,"$CONFIG{uvscan_dir}" or die $!;
+    my $file;
+    while ($file=readdir(DIR)) {
+        next unless -f "$CONFIG{uvscan_dir}/$file";
+        copy "$CONFIG{uvscan_dir}/$file",$dir
+            or do_log("I can't copy $CONFIG{uvscan_dir}/$file -> $dir\n$!");
+    }
+    closedir DIR;
+}
+
+sub restore_uvscan {
+	die "uvscan must be restored !";
+}
+
+sub today {
+	my @now = localtime(time);
+	$now[4]++;
+	$now[5]+=1900;
+	for (0..4) {
+		$now[$_] = "0$now[$_]" if $now[$_]<10;
+	}
+	
+	my $ret = '';
+	for (reverse 0..5) {
+		$ret .= $now[$_];
+	}
+	return $ret;
+}
+
+sub extract_dat {
 	my $dat = shift;
 	chdir $CONFIG{tmp_dir} or die "$! $CONFIG{tmp_dir}";
 	mkdir 'new',0755 or die "$! $CONFIG{tmp_dir}/new\n"
 		unless -d 'new';
 	`rm -f ./new/*`;
 	chdir "new" or die "$! $CONFIG{tmp_dir}/new\n";
-	return unless check_new_dats($dat);
-	chdir $CONFIG{tmp_dir} or die "$! $CONFIG{tmp_dir}";
-	mkdir 'old',0755 or die "$! $CONFIG{tmp_dir}/old\n"
-		unless -d 'old';
-	opendir NEW,"$CONFIG{tmp_dir}/new" or die $!;
-	my $file;
-	while ($file=readdir(NEW)) {
-		next unless -f "$CONFIG{tmp_dir}/new/$file";
-		copy "$CONFIG{tmp_dir}/$file","$CONFIG{tmp_dir}/old"
-			or do_log("I can't copy $CONFIG{tmp_dir}/$file -> $CONFIG{tmp_dir}/old\n$!")
-				if -f "$CONFIG{tmp_dir}/$file";
-		copy "$CONFIG{tmp_dir}/new/$file",$CONFIG{tmp_dir} 
-			or do_log("I can't copy $CONFIG{tmp_dir}/new/$file -> $CONFIG{tmp_dir}\n$!");
-		copy "$CONFIG{tmp_dir}/new/$file",$CONFIG{uvscan_dir}
-			or do_log("I can't copy $CONFIG{tmp_dir}/new/$file -> $CONFIG{tmp_dir}\n$!");
-	}
-	closedir NEW;
+	return unless check_new_dat($dat);
+
+	my $dir_backup = "$CONFIG{tmp_dir}/backup_".today();
+
+	backup_uvscan($dir_backup);
+
 	chdir $CONFIG{uvscan_dir} or die $!;
+	extract_tar("$CONFIG{tmp_dir}/avvdat-$dat.tar");
+
 	`$CHMOD go+rx *`;
+
+	if (!check_uvscan($CONFIG{uvscan_dir})) {
+		restore_uvscan($dir_backup);
+	}
 	clean_old_zip();
 	return 1;
 }
@@ -432,6 +492,7 @@ sub time_uvscan {
 
 sub decompress {
 	my $time_zip = time_uvscan();
+
 	chdir $CONFIG{uvscan_dir} or die "$!  $CONFIG{uvscan_dir}";
 	my $decompress_cmd = "$CONFIG{uvscan_dir}/uvscan --decompress";
 	open my $decompress, "$decompress_cmd|" or die $!;
@@ -468,10 +529,10 @@ sub clean_old_zip {
 	closedir LS;
 }
                                                                                 
-sub update_dat_zip {
+sub update_dat {
 	my $dat = shift;
-	download_zip($dat)
-		and unzip_dat($dat)
+	download_tar($dat)
+		and extract_dat($dat)
 		and decompress();
 }
 
@@ -513,7 +574,7 @@ unless (defined $nai_dat) {
     exit(-1);
 };
 if ($CONFIG{force} ||  $nai_dat != check_current_dat() ) {
-        update_dat_zip($nai_dat);
+        update_dat($nai_dat);
         if (check_current_dat() eq $nai_dat) {
                 report ($nai_dat);
                 do_log ("[OK] Installed new DAT. Current DAT version is $nai_dat");
