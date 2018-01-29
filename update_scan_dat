@@ -54,8 +54,7 @@ my %CONFIG_DEFAULT = (
 	debug => 0,
 	force => 0,
 	verbose => 0,
-	home_uri => 'ftp://ftp.nai.com/pub/antivirus/datfiles/4.x/',
-#	home_uri => 'http://update.nai.com/products/commonupdater',
+    home_uri => "http://download.nai.com/products/commonupdater/",
 	tmp_dir => "/var/tmp/scan",
 	log_file => '/var/log/update_scan.log',
 	uvscan_dir => "/usr/local/uvscan",
@@ -257,6 +256,7 @@ sub do_log {
         $message = "[ERROR] ".$message unless $message =~ /^\[OK\]/;
         print LOG "$now $message\n";
         close LOG;
+        warn "$message\n" if $CONFIG{debug};
         return if $message =~ /\[\d\]/;
 		exit(0) if $message =~ /^\[OK/;
 		die "$message\n";
@@ -291,12 +291,17 @@ sub get_content_lwp {
 
 sub ftp_ls {
 	my $uri = shift;
+    my $passive = shift;
+
+    my @passive = ();
+    @passive = (Passive => 1) if $passive;
+
 	die "I can't handle $uri (only ftp)\n" unless $uri =~ /^ftp:\/\//;
 	my ($server,$dir) = $uri =~ m#ftp://(.*?)(/.*)#;
 	die "I can't find a server / dir in $uri\n" unless
 		defined $server && defined $dir;
 	warn "Getting $server / $dir\n" if $CONFIG{debug};
-	my $ftp = Net::FTP->new($server,Debug => 0)
+	my $ftp = Net::FTP->new($server,Debug => 0, @passive)
 		or die "Cannot connect to $server: $@\n";
 	$ftp->login("anonymous",'-anonymous@')
              or die "Cannot login ", $ftp->message;
@@ -304,7 +309,7 @@ sub ftp_ls {
              or die "Cannot change working directory $dir ", $ftp->message;
 	my @dir = $ftp->ls($dir);
 	unless (@dir) {
-		$ftp = Net::FTP->new($server,Debug => 0, TimeOut => 300)
+		$ftp = Net::FTP->new($server,Debug => 0, TimeOut => 300, @passive)
         	or die "Cannot connect to $server: $@\n";
 		$ftp->login("anonymous",'-anonymous@')
              or die "Cannot login ", $ftp->message;
@@ -321,9 +326,13 @@ sub get_content {
 	warn "get_content $uri\n" if $CONFIG{debug};
 	for (1..$FTP_TRY) {
 		warn " get_content try $_\n" if $CONFIG{debug};
+        if ($uri =~ /^ftp/) {
+    		$content = ftp_ls($uri, 'passive');
+	    	last if $content;
+		    $content = ftp_ls($uri);
+		    last if $content;
+        }
 		$content = get_content_lwp($uri);
-		last if $content;
-		$content = ftp_ls($uri);
 		last if $content;
 		sleep $SLEEP;
 	}
@@ -338,7 +347,9 @@ sub nai_dat_version {
 		# or wget($CONFIG{home_uri}) or get_content_lwp($CONFIG{home_uri}));
         my $dat_url;
         foreach (split /\n/,$res) {
-                next unless ($dat_url) = /dat-(.*?)\.tar/;
+                ($dat_url) = /(dat-.*\.tar)/;
+                last if $dat_url;
+                ($dat_url) = /(avvdat-.*?\.zip)/;
                 last if $dat_url;
         }
         do_log ("I can't find the dat link")
@@ -358,8 +369,7 @@ sub download_dat {
 }
 
 sub download_tar {
-		my $dat = shift;
-		my $dat_zip = "avvdat-".$dat.".tar";
+		my $dat_zip = shift;
 		if (! -d $CONFIG{tmp_dir} ) {
 			mkdir $CONFIG{tmp_dir},0777 or die "$! $CONFIG{tmp_dir}";
 		}
@@ -388,6 +398,18 @@ sub extract_tar {
 	do_log("problem unzipping '$CONFIG{tmp_dir}/$file") if $?;
 }
 
+sub extract_zip {
+    my $file = shift;
+    print "extracting $file (".getcwd.")\n" if $CONFIG{debug};
+    open ZIP,"$UNZIP -o $file|" or die $!;
+    while (<ZIP>) {
+        print if $CONFIG{debug};
+    }
+    close ZIP ;
+    do_log("problem unzipping '$CONFIG{tmp_dir}/$file") if $?;
+
+}
+
 sub check_new_dat {
 
 	my $dat = shift;
@@ -399,10 +421,18 @@ sub check_new_dat {
             or die "$! $CONFIG{uvscan_dir}/$file";
     }
     chmod 0700,'uvscan';
-    my $dat_tar = "avvdat-$dat.tar";
-    extract_tar("../$dat_tar");
+    extract_file("../$dat");
 
 	return check_uvscan("$CONFIG{tmp_dir}/new");
+}
+
+sub extract_file {
+    my $file = shift;
+    if ($file =~ /\.tar/) {
+        return extract_tar($file);
+    } elsif ($file =~ /\.zip$/) {
+        return extract_zip($file);
+    }
 }
 
 sub check_uvscan {
@@ -469,7 +499,11 @@ sub extract_dat {
 	backup_uvscan($dir_backup);
 
 	chdir $CONFIG{uvscan_dir} or die $!;
-	extract_tar("$CONFIG{tmp_dir}/avvdat-$dat.tar");
+    if ($dat =~ /\.tar/) {
+	    extract_tar("$CONFIG{tmp_dir}/$dat");
+    } elsif ($dat =~ /.zip$/) {
+	    extract_zip("$CONFIG{tmp_dir}/$dat");
+    }
 
 	`$CHMOD go+rx *`;
 
@@ -531,9 +565,9 @@ sub clean_old_zip {
                                                                                 
 sub update_dat {
 	my $dat = shift;
-	download_tar($dat)
-		and extract_dat($dat)
-		and decompress();
+	download_tar($dat);
+	extract_dat($dat)
+	    and decompress();
 }
 
 sub check_uvscan_release {
@@ -567,14 +601,15 @@ my $options = getopt();
 config($options);
 check_uvscan_release();
 init();
-my $nai_dat = nai_dat_version();
+my $url_dat = nai_dat_version();
+my ($nai_dat) = $url_dat =~ m{(\d+)};
 
 unless (defined $nai_dat) {
     warn "Unable to get nai ftp dat version\n";
     exit(-1);
 };
 if ($CONFIG{force} ||  $nai_dat != check_current_dat() ) {
-        update_dat($nai_dat);
+        update_dat($url_dat);
         if (check_current_dat() eq $nai_dat) {
                 report ($nai_dat);
                 do_log ("[OK] Installed new DAT. Current DAT version is $nai_dat");
