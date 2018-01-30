@@ -63,7 +63,6 @@ my %CONFIG_DEFAULT = (
 	group => 'users',
 	days_keep_files => 60,
 	mailhost => 'localhost',
-	pid_dir => '/var/run',
 	ftp_proxy => undef,
 	http_proxy => undef,
 #	file_ini => 'avvdat.ini',
@@ -219,7 +218,7 @@ sub init {
 		die if $?;
 		die "Can't create $CONFIG{log_file}" unless -f $CONFIG{log_file};
 	}
-	die "Already running!" if Proc::PID::File->running(dir=>$CONFIG{pid_dir});
+	die "Already running!" if Proc::PID::File->running();#file => { dir =>$CONFIG{pid_dir}});
 	$ua->proxy('http',($ENV{http_proxy} or $CONFIG{http_proxy} or '' ) );
 	$ua->proxy('ftp',($ENV{ftp_proxy} or $CONFIG{ftp_proxy} or '') );
 
